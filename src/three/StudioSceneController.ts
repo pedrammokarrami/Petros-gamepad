@@ -76,6 +76,7 @@ interface AnchorPinVisual {
 export interface SceneControllerCallbacks {
   onTimeUpdate: (timeMs: number, activeEvents: SequenceEvent[]) => void;
   onPlayStateChange: (isPlaying: boolean) => void;
+  onLoopRestart?: () => void;
 }
 
 // Reusable scratch math objects (zero allocations inside render loop)
@@ -159,6 +160,7 @@ export class StudioSceneController {
   private loopEnabled = true;
   private currentTimeMs = 0;
   private prevEvaluatedMs: number | null = null;
+  private hardwareInputs: Record<string, { value: number; color: string }> = {};
   private springTilt: Spring3DState = createSpring3DState();
   private showcaseSpring: Spring3DState = createSpring3DState();
   private liftSpring: SpringState = { value: 0, velocity: 0 };
@@ -1155,6 +1157,23 @@ export class StudioSceneController {
     this.ensureLoopRunning();
   }
 
+  /**
+   * Mirrors real physical Bluetooth controller / keyboard / mouse button presses directly onto the 3D hardware.
+   */
+  public setHardwareInputs(inputs: Record<string, { value: number; color: string }>) {
+    this.hardwareInputs = { ...inputs };
+    this.evaluateAndApplyFrame(0.016, false);
+    this.ensureLoopRunning();
+  }
+
+  /**
+   * Fires a studio pedestal shockwave ring in the feedback color (emerald on hit, crimson on mistake).
+   */
+  public triggerFeedbackPulse(hexColor: string) {
+    this.stage.spawnShockwave(hexColor);
+    this.ensureLoopRunning();
+  }
+
   private resolveTouchCoordinate(event: SequenceEvent): { x: number; y: number } {
     if (event.touch) return event.touch;
     const spec = DEVICE_BUTTONS.ipad.find((b) => b.id === event.target_mesh);
@@ -1209,6 +1228,25 @@ export class StudioSceneController {
             color: item.event.color,
           });
         }
+      }
+    }
+
+    // Overlay real-time physical Bluetooth/Hardware button presses (takes priority for live hit/error glow!)
+    for (const [btnId, hw] of Object.entries(this.hardwareInputs)) {
+      if (hw.value <= 0.01) continue;
+      activeButtonLookup.set(btnId, {
+        intensity: Math.max(0.45, Math.min(1, hw.value)),
+        color: hw.color,
+      });
+      const concreteMesh = resolveTargetMeshName(this.meshMapping, btnId);
+      const skipWholeMeshGlow =
+        this.deviceType === 'ipad' ||
+        (Boolean(this.surfaceAnchors[btnId]) && this.pickableMeshes.length <= 2);
+      if (!skipWholeMeshGlow) {
+        activeMeshLookup.set(concreteMesh, {
+          intensity: Math.max(0.55, Math.min(1, hw.value)),
+          color: hw.color,
+        });
       }
     }
 
@@ -1470,6 +1508,7 @@ export class StudioSceneController {
         if (this.loopEnabled) {
           this.currentTimeMs = this.currentTimeMs % Math.max(1, this.sequence.duration_ms);
           this.prevEvaluatedMs = null;
+          this.callbacks.onLoopRestart?.();
         } else {
           this.currentTimeMs = this.sequence.duration_ms;
           this.isPlaying = false;

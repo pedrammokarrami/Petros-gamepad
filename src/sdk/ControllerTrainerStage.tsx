@@ -1,3 +1,5 @@
+'use client';
+
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   DEFAULT_SEQUENCES,
@@ -6,6 +8,13 @@ import {
   normalizeDeviceType,
 } from '../data/devices';
 import { sanitizeAnchorMap } from '../core/glbPlacement';
+import {
+  computePracticeStats,
+  createPracticeSession,
+  evaluatePracticeButtonPress,
+  evaluatePracticeMisses,
+  type PracticeSessionState,
+} from '../core/practiceEngine';
 import { StudioSceneController } from '../three/StudioSceneController';
 import {
   buildSequenceEndpointUrl,
@@ -13,10 +22,12 @@ import {
   normalizeBackendPayload,
   type NormalizedBackendResponse,
 } from './apiClient';
+import { HardwareInputService } from './hardwareInputService';
 import type {
   AllAnchorMaps,
   AllMeshMappings,
   BackendSequencePayload,
+  ConnectedControllerInfo,
   ControllerTrainerProps,
   DemoPreset,
   DeviceAnchorMap,
@@ -24,12 +35,16 @@ import type {
   DeviceModelUrls,
   DeviceType,
   LegacyDeviceAlias,
+  PracticeFeedbackEntry,
+  PracticeSessionStats,
   SequenceEvent,
+  TrainerMode,
   TrainingSequence,
 } from '../types/trainer';
 import { DeviceSwitcher } from '../components/DeviceSwitcher';
 import { CalloutBadge } from '../components/CalloutBadge';
 import { TimelineDock } from '../components/TimelineDock';
+import { BluetoothModal } from '../components/BluetoothModal';
 
 const EMPTY_MAPPINGS: AllMeshMappings = { ps5: {}, xbox: {}, pc: {}, ipad: {} };
 const EMPTY_ANCHORS: AllAnchorMaps = { ps5: {}, xbox: {}, pc: {}, ipad: {} };
@@ -59,6 +74,7 @@ function mergeModelConfigs(
 
 export function ControllerTrainerStage({
   initialDevice = 'ps5',
+  initialMode = 'demo',
   apiBaseUrl,
   fetchSequence,
   sequences: propSequences,
@@ -72,6 +88,8 @@ export function ControllerTrainerStage({
   onActiveEventsChange,
   onSequenceLoaded,
   onPlayStateChange,
+  onPracticeFeedback,
+  onControllerConnectionChange,
   onApiError,
   className = '',
 }: ControllerTrainerProps) {
@@ -82,9 +100,11 @@ export function ControllerTrainerStage({
 
   const canvasMountRef = useRef<HTMLDivElement | null>(null);
   const controllerRef = useRef<StudioSceneController | null>(null);
+  const hardwareServiceRef = useRef<HardwareInputService | null>(null);
   const fetchRequestIdRef = useRef(0);
 
   const [activeDevice, setActiveDevice] = useState<DeviceType>(resolvedInitialDevice);
+  const [mode, setMode] = useState<TrainerMode>(initialMode);
   const [sequences, setSequences] = useState<Record<DeviceType, TrainingSequence>>(() => ({
     ps5: propSequences?.ps5 ?? DEFAULT_SEQUENCES.ps5,
     xbox: propSequences?.xbox ?? DEFAULT_SEQUENCES.xbox,
@@ -119,6 +139,23 @@ export function ControllerTrainerStage({
     {},
   );
 
+  // Real Bluetooth / Hardware controller & Live Practice state
+  const [connectedController, setConnectedController] = useState<ConnectedControllerInfo | null>(
+    null,
+  );
+  const [pressedHardwareButtons, setPressedHardwareButtons] = useState<Record<string, number>>({});
+  const [isBluetoothModalOpen, setIsBluetoothModalOpen] = useState(false);
+
+  const practiceSessionRef = useRef<PracticeSessionState>(
+    createPracticeSession(propSequences?.[resolvedInitialDevice] ?? DEFAULT_SEQUENCES[resolvedInitialDevice]),
+  );
+  const [practiceStats, setPracticeStats] = useState<PracticeSessionStats>(() =>
+    computePracticeStats(practiceSessionRef.current),
+  );
+  const [liveFeedback, setLiveFeedback] = useState<PracticeFeedbackEntry | null>(null);
+  const feedbackTimerRef = useRef<number | null>(null);
+  const hwColorOverridesRef = useRef<Record<string, string>>({});
+
   const [currentTimeMs, setCurrentTimeMs] = useState(0);
   const [activeEvents, setActiveEvents] = useState<SequenceEvent[]>([]);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -128,6 +165,7 @@ export function ControllerTrainerStage({
 
   // Fresh refs to avoid recreating the WebGLRenderer when props/state change
   const activeDeviceRef = useRef(activeDevice);
+  const modeRef = useRef(mode);
   const sequencesRef = useRef(sequences);
   const mappingsRef = useRef(mappings);
   const anchorsRef = useRef(anchors);
@@ -137,16 +175,21 @@ export function ControllerTrainerStage({
   const autoPlayRef = useRef(autoPlay);
   const apiBaseUrlRef = useRef(apiBaseUrl);
   const fetchSequenceRef = useRef(fetchSequence);
+  const connectedControllerRef = useRef(connectedController);
+  const practiceStatsRef = useRef(practiceStats);
 
   const callbacksRef = useRef({
     onDeviceChange,
     onActiveEventsChange,
     onSequenceLoaded,
     onPlayStateChange,
+    onPracticeFeedback,
+    onControllerConnectionChange,
     onApiError,
   });
 
   activeDeviceRef.current = activeDevice;
+  modeRef.current = mode;
   sequencesRef.current = sequences;
   mappingsRef.current = mappings;
   anchorsRef.current = anchors;
@@ -156,11 +199,15 @@ export function ControllerTrainerStage({
   autoPlayRef.current = autoPlay;
   apiBaseUrlRef.current = apiBaseUrl;
   fetchSequenceRef.current = fetchSequence;
+  connectedControllerRef.current = connectedController;
+  practiceStatsRef.current = practiceStats;
   callbacksRef.current = {
     onDeviceChange,
     onActiveEventsChange,
     onSequenceLoaded,
     onPlayStateChange,
+    onPracticeFeedback,
+    onControllerConnectionChange,
     onApiError,
   };
 
@@ -172,6 +219,38 @@ export function ControllerTrainerStage({
         // Cross-origin parent postMessage ignored safely
       }
     }
+  }, []);
+
+  const showTransientFeedback = useCallback((entry: PracticeFeedbackEntry) => {
+    setLiveFeedback(entry);
+    if (feedbackTimerRef.current !== null) {
+      window.clearTimeout(feedbackTimerRef.current);
+    }
+    feedbackTimerRef.current = window.setTimeout(() => {
+      setLiveFeedback(null);
+      feedbackTimerRef.current = null;
+    }, 3500);
+  }, []);
+
+  const resetPracticeSession = useCallback((seq?: TrainingSequence) => {
+    const targetSeq = seq ?? sequencesRef.current[activeDeviceRef.current];
+    practiceSessionRef.current = createPracticeSession(targetSeq);
+    const freshStats = computePracticeStats(practiceSessionRef.current);
+    practiceStatsRef.current = freshStats;
+    setPracticeStats(freshStats);
+    setLiveFeedback(null);
+    hwColorOverridesRef.current = {};
+  }, []);
+
+  const pushHardwareInputsTo3D = useCallback((pressedMap: Record<string, number>) => {
+    const styled: Record<string, { value: number; color: string }> = {};
+    for (const [btnId, val] of Object.entries(pressedMap)) {
+      styled[btnId] = {
+        value: val,
+        color: hwColorOverridesRef.current[btnId] ?? '#38bdf8',
+      };
+    }
+    controllerRef.current?.setHardwareInputs(styled);
   }, []);
 
   // Apply normalized backend/API payload to state & 3D scene
@@ -202,24 +281,27 @@ export function ControllerTrainerStage({
           setActiveEvents([]);
           ctrl.setPlaying(false);
           ctrl.setDevice(device, data.sequence, nextMapping, nextAnchors);
+          resetPracticeSession(data.sequence);
           callbacksRef.current.onDeviceChange?.(device);
           emitParentEvent('deviceChange', { device });
         } else if (device === activeDeviceRef.current || switchToDevice) {
           if (data.meshMapping) ctrl.setMeshMapping(data.meshMapping);
           if (data.surfaceAnchors) ctrl.setSurfaceAnchors(data.surfaceAnchors);
           ctrl.setSequence(data.sequence, true);
+          resetPracticeSession(data.sequence);
         }
         if (autoPlayRef.current) {
           ctrl.setPlaying(true);
         }
       } else if (switchToDevice) {
         setActiveDevice(device);
+        resetPracticeSession(data.sequence);
       }
 
       callbacksRef.current.onSequenceLoaded?.(device, data.sequence);
       emitParentEvent('sequenceLoaded', { device, title: data.sequence.title });
     },
-    [emitParentEvent],
+    [emitParentEvent, resetPracticeSession],
   );
 
   // Fetch sequence from custom fetcher or apiBaseUrl whenever configured
@@ -294,14 +376,39 @@ export function ControllerTrainerStage({
       sequencesRef.current[startDevice],
       {
         onTimeUpdate: (timeMs, events) => {
+          currentTimeRef.current = timeMs;
           setCurrentTimeMs(timeMs);
           setActiveEvents(events);
           callbacksRef.current.onActiveEventsChange?.(events, timeMs);
+
+          // Live Practice Miss Detection while playing
+          if (modeRef.current === 'practice' && isPlayingRef.current) {
+            const seq = sequencesRef.current[activeDeviceRef.current];
+            const missRes = evaluatePracticeMisses(practiceSessionRef.current, seq, timeMs);
+            if (missRes.newlyMissed.length > 0) {
+              practiceSessionRef.current = missRes.session;
+              const stats = computePracticeStats(missRes.session);
+              practiceStatsRef.current = stats;
+              setPracticeStats(stats);
+              const lastMiss = missRes.newlyMissed[missRes.newlyMissed.length - 1];
+              showTransientFeedback(lastMiss);
+              controllerRef.current?.triggerFeedbackPulse('#f43f5e');
+              hardwareServiceRef.current?.triggerHaptic('error');
+              callbacksRef.current.onPracticeFeedback?.(lastMiss, stats);
+              emitParentEvent('practiceFeedback', { feedback: lastMiss, stats });
+            }
+          }
         },
         onPlayStateChange: (playing) => {
+          isPlayingRef.current = playing;
           setIsPlaying(playing);
           callbacksRef.current.onPlayStateChange?.(playing);
           emitParentEvent('playStateChange', { isPlaying: playing });
+        },
+        onLoopRestart: () => {
+          if (modeRef.current === 'practice') {
+            resetPracticeSession();
+          }
         },
       },
     );
@@ -314,7 +421,6 @@ export function ControllerTrainerStage({
       controller.setPlaying(true);
     }
 
-    // Trigger initial backend fetch if apiBaseUrl or fetchSequence is provided
     void loadFromBackendIfConfigured(startDevice);
 
     if (typeof window !== 'undefined' && window.parent && window.parent !== window) {
@@ -326,10 +432,110 @@ export function ControllerTrainerStage({
     }
 
     return () => {
+      if (feedbackTimerRef.current !== null) {
+        window.clearTimeout(feedbackTimerRef.current);
+      }
       controller.dispose();
       controllerRef.current = null;
     };
-  }, [emitParentEvent, loadFromBackendIfConfigured]);
+  }, [emitParentEvent, loadFromBackendIfConfigured, resetPracticeSession, showTransientFeedback]);
+
+  // Mount Real Bluetooth / Gamepad / PC Hardware Input Service ONCE
+  useEffect(() => {
+    const hw = new HardwareInputService({
+      onConnectionChange: (info) => {
+        setConnectedController(info);
+        callbacksRef.current.onControllerConnectionChange?.(info);
+        emitParentEvent('controllerConnection', { controller: info });
+
+        // Automatically switch to the detected Bluetooth controller platform (DualSense -> ps5, Xbox -> xbox)
+        if (info && activeDeviceRef.current !== info.detectedDevice) {
+          const target = info.detectedDevice;
+          setActiveDevice(target);
+          setCurrentTimeMs(0);
+          setActiveEvents([]);
+          controllerRef.current?.setPlaying(false);
+          controllerRef.current?.setDevice(
+            target,
+            sequencesRef.current[target],
+            mappingsRef.current[target],
+            anchorsRef.current[target],
+          );
+          resetPracticeSession(sequencesRef.current[target]);
+          callbacksRef.current.onDeviceChange?.(target);
+          emitParentEvent('deviceChange', { device: target });
+        }
+      },
+      onButtonPress: (buttonId) => {
+        if (modeRef.current === 'practice') {
+          const seq = sequencesRef.current[activeDeviceRef.current];
+          const timeMs = currentTimeRef.current;
+          const evaluated = evaluatePracticeButtonPress(
+            practiceSessionRef.current,
+            seq,
+            buttonId,
+            timeMs,
+          );
+          practiceSessionRef.current = evaluated.session;
+          const stats = computePracticeStats(evaluated.session);
+          practiceStatsRef.current = stats;
+          setPracticeStats(stats);
+          showTransientFeedback(evaluated.feedback);
+
+          const isSuccess =
+            evaluated.feedback.judgement === 'perfect' ||
+            evaluated.feedback.judgement === 'good';
+          const isTimingWarning =
+            evaluated.feedback.judgement === 'early' ||
+            evaluated.feedback.judgement === 'late';
+          const glowHex = isSuccess
+            ? '#34d399'
+            : isTimingWarning
+              ? '#fbbf24'
+              : '#f43f5e';
+
+          hwColorOverridesRef.current[buttonId] = glowHex;
+          controllerRef.current?.triggerFeedbackPulse(glowHex);
+          hw.triggerHaptic(isSuccess ? 'hit' : 'error');
+
+          callbacksRef.current.onPracticeFeedback?.(evaluated.feedback, stats);
+          emitParentEvent('practiceFeedback', {
+            feedback: evaluated.feedback,
+            stats,
+          });
+        } else {
+          // Even in Watch mode, real Bluetooth presses illuminate the 3D controller cleanly!
+          hwColorOverridesRef.current[buttonId] = '#38bdf8';
+          controllerRef.current?.triggerFeedbackPulse('#38bdf8');
+        }
+      },
+      onButtonRelease: (buttonId) => {
+        delete hwColorOverridesRef.current[buttonId];
+      },
+      onActiveButtonsChange: (pressedMap) => {
+        setPressedHardwareButtons(pressedMap);
+        pushHardwareInputsTo3D(pressedMap);
+      },
+    });
+
+    hw.setTargetDevice(activeDeviceRef.current);
+    hw.setCapturePcInputs(modeRef.current === 'practice');
+    hardwareServiceRef.current = hw;
+
+    return () => {
+      hw.dispose();
+      hardwareServiceRef.current = null;
+    };
+  }, [emitParentEvent, pushHardwareInputsTo3D, resetPracticeSession, showTransientFeedback]);
+
+  // Keep HardwareInputService synced with activeDevice & mode
+  useEffect(() => {
+    hardwareServiceRef.current?.setTargetDevice(activeDevice);
+  }, [activeDevice]);
+
+  useEffect(() => {
+    hardwareServiceRef.current?.setCapturePcInputs(mode === 'practice');
+  }, [mode]);
 
   // Sync merged GLB model URLs into the 3D scene controller
   useEffect(() => {
@@ -345,10 +551,11 @@ export function ControllerTrainerStage({
       const activeSeq = propSequences[activeDeviceRef.current];
       if (activeSeq) {
         controllerRef.current?.setSequence(activeSeq, true);
+        resetPracticeSession(activeSeq);
       }
       return next;
     });
-  }, [propSequences]);
+  }, [propSequences, resetPracticeSession]);
 
   // Sync reactive prop presets
   useEffect(() => {
@@ -404,16 +611,41 @@ export function ControllerTrainerStage({
         mappingsRef.current[device],
         anchorsRef.current[device],
       );
+      resetPracticeSession(sequencesRef.current[device]);
       callbacksRef.current.onDeviceChange?.(device);
       emitParentEvent('deviceChange', { device });
       void loadFromBackendIfConfigured(device);
     },
-    [emitParentEvent, loadFromBackendIfConfigured],
+    [emitParentEvent, loadFromBackendIfConfigured, resetPracticeSession],
   );
 
+  const handleSelectMode = useCallback(
+    (nextMode: TrainerMode) => {
+      setMode(nextMode);
+      modeRef.current = nextMode;
+      if (nextMode === 'practice') {
+        resetPracticeSession();
+        controllerRef.current?.seek(0);
+      } else {
+        setLiveFeedback(null);
+      }
+    },
+    [resetPracticeSession],
+  );
+
+  const handleResetPracticeAndRestart = useCallback(() => {
+    resetPracticeSession();
+    controllerRef.current?.seek(0);
+    controllerRef.current?.setPlaying(true);
+  }, [resetPracticeSession]);
+
   const handleTogglePlay = useCallback(() => {
-    controllerRef.current?.setPlaying(!isPlayingRef.current);
-  }, []);
+    const willPlay = !isPlayingRef.current;
+    if (willPlay && modeRef.current === 'practice' && currentTimeRef.current <= 10) {
+      resetPracticeSession();
+    }
+    controllerRef.current?.setPlaying(willPlay);
+  }, [resetPracticeSession]);
 
   const handleToggleLoop = useCallback(() => {
     setLoopEnabled((prev) => {
@@ -423,18 +655,28 @@ export function ControllerTrainerStage({
     });
   }, []);
 
-  const handleSeek = useCallback((ms: number) => {
-    controllerRef.current?.seek(ms);
-  }, []);
+  const handleSeek = useCallback(
+    (ms: number) => {
+      if (modeRef.current === 'practice' && ms < currentTimeRef.current) {
+        resetPracticeSession();
+      }
+      controllerRef.current?.seek(ms);
+    },
+    [resetPracticeSession],
+  );
 
-  const handleSelectPreset = useCallback((preset: DemoPreset) => {
-    const dev = activeDeviceRef.current;
-    setActivePresetIds((prev) => ({ ...prev, [dev]: preset.id }));
-    setSequences((prev) => ({ ...prev, [dev]: preset.sequence }));
-    controllerRef.current?.setSequence(preset.sequence, true);
-    controllerRef.current?.setPlaying(true);
-    callbacksRef.current.onSequenceLoaded?.(dev, preset.sequence);
-  }, []);
+  const handleSelectPreset = useCallback(
+    (preset: DemoPreset) => {
+      const dev = activeDeviceRef.current;
+      setActivePresetIds((prev) => ({ ...prev, [dev]: preset.id }));
+      setSequences((prev) => ({ ...prev, [dev]: preset.sequence }));
+      resetPracticeSession(preset.sequence);
+      controllerRef.current?.setSequence(preset.sequence, true);
+      controllerRef.current?.setPlaying(true);
+      callbacksRef.current.onSequenceLoaded?.(dev, preset.sequence);
+    },
+    [resetPracticeSession],
+  );
 
   // Register global host integration API (`window.AstroTrainerAPI`) + iframe `postMessage` bridge
   useEffect(() => {
@@ -479,6 +721,9 @@ export function ControllerTrainerStage({
           handleSelectDevice(normalizedDevice);
         }
       },
+      setMode: (nextMode: TrainerMode) => {
+        handleSelectMode(nextMode);
+      },
       setMeshMapping: (deviceType: LegacyDeviceAlias, mapping: DeviceMeshMapping) => {
         const normalizedDevice = normalizeDeviceType(deviceType);
         if (!normalizedDevice) return;
@@ -496,9 +741,18 @@ export function ControllerTrainerStage({
           controllerRef.current?.setSurfaceAnchors(clean);
         }
       },
+      connectBluetooth: async () => {
+        return (await hardwareServiceRef.current?.connectBluetooth()) ?? null;
+      },
+      getControllerStatus: () => connectedControllerRef.current,
+      getPracticeStats: () => practiceStatsRef.current,
+      resetPractice: () => resetPracticeSession(),
+      simulateHardwareInput: (buttonId: string, pressed: boolean, value = 1) => {
+        hardwareServiceRef.current?.simulateInput(buttonId, pressed, value);
+      },
       play: () => controllerRef.current?.setPlaying(true),
       pause: () => controllerRef.current?.setPlaying(false),
-      seek: (ms: number) => controllerRef.current?.seek(ms),
+      seek: (ms: number) => handleSeek(ms),
       setLoop: (enabled: boolean) => {
         setLoopEnabled(enabled);
         controllerRef.current?.setLoopEnabled(enabled);
@@ -506,9 +760,12 @@ export function ControllerTrainerStage({
       resetCamera: () => controllerRef.current?.resetCamera(),
       getState: () => ({
         device: activeDeviceRef.current,
+        mode: modeRef.current,
         currentTimeMs: currentTimeRef.current,
         isPlaying: isPlayingRef.current,
         loopEnabled: loopEnabledRef.current,
+        controller: connectedControllerRef.current,
+        practiceStats: practiceStatsRef.current,
         sequence: sequencesRef.current[activeDeviceRef.current],
       }),
     };
@@ -535,6 +792,26 @@ export function ControllerTrainerStage({
         case 'setDevice':
           if (typeof msg.device === 'string') {
             api.setDevice(msg.device as LegacyDeviceAlias);
+          }
+          break;
+        case 'setMode':
+          if (msg.mode === 'demo' || msg.mode === 'practice') {
+            api.setMode(msg.mode);
+          }
+          break;
+        case 'connectBluetooth':
+          void api.connectBluetooth();
+          break;
+        case 'resetPractice':
+          api.resetPractice();
+          break;
+        case 'simulateHardwareInput':
+          if (typeof msg.buttonId === 'string' && typeof msg.pressed === 'boolean') {
+            api.simulateHardwareInput(
+              msg.buttonId,
+              msg.pressed,
+              typeof msg.value === 'number' ? msg.value : 1,
+            );
           }
           break;
         case 'setMeshMapping':
@@ -576,19 +853,21 @@ export function ControllerTrainerStage({
       window.removeEventListener('message', handlePostMessage);
       delete window.AstroTrainerAPI;
     };
-  }, [applyNormalizedPayload, handleSelectDevice]);
+  }, [applyNormalizedPayload, handleSeek, handleSelectDevice, handleSelectMode, resetPracticeSession]);
 
-  // Global keyboard shortcuts (Space: Play/Pause, H: Toggle Fullscreen Stage)
+  // Global keyboard shortcuts (Space: Play/Pause when not in PC practice mode, H: Toggle Fullscreen Stage)
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement | null)?.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
 
-      if (e.code === 'Space') {
+      if (e.code === 'Space' && !(modeRef.current === 'practice' && activeDeviceRef.current === 'pc')) {
         e.preventDefault();
         handleTogglePlay();
-      } else if (e.key === 'h' || e.key === 'H') {
+      } else if ((e.key === 'h' || e.key === 'H') && !(modeRef.current === 'practice' && activeDeviceRef.current === 'pc')) {
         setIsHudCollapsed((v) => !v);
+      } else if (e.key === 'Escape') {
+        setIsBluetoothModalOpen(false);
       }
     };
     window.addEventListener('keydown', onKeyDown);
@@ -602,7 +881,9 @@ export function ControllerTrainerStage({
     <main
       dir="ltr"
       data-device={activeDevice}
+      data-mode={mode}
       data-playing={isPlaying ? 'true' : 'false'}
+      data-bt-connected={connectedController ? 'true' : 'false'}
       className={`relative w-full h-full overflow-hidden bg-[#c8cfd9] ${className}`.trim()}
     >
       {/* Dedicated isolated WebGL canvas container (never re-rendered by HUD updates) */}
@@ -617,10 +898,14 @@ export function ControllerTrainerStage({
         <DeviceSwitcher activeDevice={activeDevice} onSelect={handleSelectDevice} />
       )}
 
-      {/* Floating Glassmorphic Active Input Callout Badge */}
-      <CalloutBadge activeEvents={activeEvents} />
+      {/* Floating Glassmorphic Active Input / Live Practice Judgement Callout */}
+      <CalloutBadge
+        activeEvents={activeEvents}
+        mode={mode}
+        practiceFeedback={liveFeedback}
+      />
 
-      {/* Bottom VisionOS Dark Glass Timeline Dock */}
+      {/* Bottom VisionOS Dark Glass Timeline & Live Bluetooth Test Dock */}
       <TimelineDock
         sequence={currentSequence}
         demoPresets={currentDemoPresets}
@@ -630,12 +915,37 @@ export function ControllerTrainerStage({
         loopEnabled={loopEnabled}
         isCollapsed={isHudCollapsed}
         isLoadingSequence={isLoadingSequence}
+        mode={mode}
+        controller={connectedController}
+        practiceStats={practiceStats}
+        onSelectMode={handleSelectMode}
+        onOpenBluetooth={() => {
+          hardwareServiceRef.current?.scanExistingGamepads();
+          setIsBluetoothModalOpen(true);
+        }}
+        onResetPractice={handleResetPracticeAndRestart}
         onSelectPreset={handleSelectPreset}
         onTogglePlay={handleTogglePlay}
         onToggleLoop={handleToggleLoop}
         onSeek={handleSeek}
         onToggleCollapse={() => setIsHudCollapsed((v) => !v)}
         onResetCamera={() => controllerRef.current?.resetCamera()}
+      />
+
+      {/* Compact Bluetooth Pairing & Live Button Tester Modal */}
+      <BluetoothModal
+        open={isBluetoothModalOpen}
+        activeDevice={activeDevice}
+        controller={connectedController}
+        pressedButtons={Object.keys(pressedHardwareButtons)}
+        onClose={() => setIsBluetoothModalOpen(false)}
+        onScanBluetooth={() => {
+          void hardwareServiceRef.current?.connectBluetooth();
+        }}
+        onStartLiveTest={() => {
+          handleSelectMode('practice');
+          controllerRef.current?.setPlaying(true);
+        }}
       />
     </main>
   );

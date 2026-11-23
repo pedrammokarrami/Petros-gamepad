@@ -7,6 +7,8 @@ export type LegacyDeviceAlias =
   | 'mouse'
   | 'ios';
 
+export type TrainerMode = 'demo' | 'practice';
+
 export interface TiltVector {
   x: number;
   y: number;
@@ -111,6 +113,63 @@ export interface DeviceModelUrls {
 }
 
 /**
+ * Connected real physical Bluetooth / USB controller telemetry.
+ */
+export interface ConnectedControllerInfo {
+  id: string;
+  name: string;
+  index: number;
+  detectedDevice: 'ps5' | 'xbox';
+  connectionType: 'bluetooth-gamepad' | 'webhid' | 'simulated';
+  hasHaptics: boolean;
+  connectedAt: number;
+}
+
+export type PracticeJudgement =
+  | 'perfect'
+  | 'good'
+  | 'early'
+  | 'late'
+  | 'wrong'
+  | 'missed';
+
+export interface PracticeFeedbackEntry {
+  id: string;
+  judgement: PracticeJudgement;
+  pressedButtonId: string | null;
+  expectedButtonId: string | null;
+  expectedLabel?: string;
+  /** Signed timing error in ms: negative = early, positive = late */
+  deltaMs: number | null;
+  timestampMs: number;
+  eventId?: string;
+  message: string;
+}
+
+export interface PracticeEventOutcome {
+  eventId: string;
+  targetMesh: string;
+  status: 'pending' | 'perfect' | 'good' | 'early' | 'late' | 'missed';
+  deltaMs: number | null;
+}
+
+export interface PracticeSessionStats {
+  totalEvents: number;
+  perfectCount: number;
+  goodCount: number;
+  timingErrorCount: number;
+  wrongButtonCount: number;
+  missedCount: number;
+  streak: number;
+  bestStreak: number;
+  accuracyPct: number;
+  avgDeltaMs: number | null;
+  outcomes: Record<string, PracticeEventOutcome>;
+  lastFeedback: PracticeFeedbackEntry | null;
+  history: PracticeFeedbackEntry[];
+}
+
+/**
  * Standardized backend response payload for a device training scenario.
  * Backends may return either this envelope or a raw TrainingSequence object directly.
  */
@@ -128,6 +187,8 @@ export interface BackendSequencePayload {
 export interface ControllerTrainerProps {
   /** Initial active platform ('ps5' | 'playstation' | 'xbox' | 'pc' | 'ipad' | 'ios') */
   initialDevice?: LegacyDeviceAlias;
+  /** Initial operating mode: 'demo' (watch choreography) or 'practice' (live Bluetooth/hardware testing) */
+  initialMode?: TrainerMode;
   /** Optional REST API base URL; fetches `${apiBaseUrl}?device=${device}` on platform switch */
   apiBaseUrl?: string;
   /** Optional custom async fetcher (e.g., with auth headers, Axios, or React Query) */
@@ -154,6 +215,8 @@ export interface ControllerTrainerProps {
   onActiveEventsChange?: (events: SequenceEvent[], timeMs: number) => void;
   onSequenceLoaded?: (device: DeviceType, sequence: TrainingSequence) => void;
   onPlayStateChange?: (isPlaying: boolean) => void;
+  onPracticeFeedback?: (feedback: PracticeFeedbackEntry, stats: PracticeSessionStats) => void;
+  onControllerConnectionChange?: (controller: ConnectedControllerInfo | null) => void;
   onApiError?: (error: Error, device: DeviceType) => void;
   className?: string;
 }
@@ -166,8 +229,15 @@ export interface AstroTrainerPublicAPI {
     fetchInit?: RequestInit,
   ) => Promise<boolean>;
   setDevice: (deviceType: LegacyDeviceAlias) => void;
+  setMode: (mode: TrainerMode) => void;
   setMeshMapping: (deviceType: LegacyDeviceAlias, mapping: DeviceMeshMapping) => void;
   setSurfaceAnchors: (deviceType: LegacyDeviceAlias, anchors: DeviceAnchorMap) => void;
+  connectBluetooth: () => Promise<ConnectedControllerInfo | null>;
+  getControllerStatus: () => ConnectedControllerInfo | null;
+  getPracticeStats: () => PracticeSessionStats;
+  resetPractice: () => void;
+  /** Programmatic/automated hardware input trigger (mirrors real Bluetooth controller press/release) */
+  simulateHardwareInput: (buttonId: string, pressed: boolean, value?: number) => void;
   play: () => void;
   pause: () => void;
   seek: (ms: number) => void;
@@ -175,9 +245,12 @@ export interface AstroTrainerPublicAPI {
   resetCamera: () => void;
   getState: () => {
     device: DeviceType;
+    mode: TrainerMode;
     currentTimeMs: number;
     isPlaying: boolean;
     loopEnabled: boolean;
+    controller: ConnectedControllerInfo | null;
+    practiceStats: PracticeSessionStats;
     sequence: TrainingSequence;
   };
 }
