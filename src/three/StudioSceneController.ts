@@ -10,10 +10,9 @@ import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import type {
   DeviceAnchorMap,
   DeviceMeshMapping,
+  DeviceModelUrls,
   DeviceType,
   GlbTransform,
-  PcGlbSlot,
-  SelectedMeshInfo,
   SequenceEvent,
   SurfaceAnchor,
   TrainingSequence,
@@ -27,13 +26,14 @@ import {
   stepSpring1D,
   stepSpring3D,
 } from '../core/sequenceEngine';
-import { findButtonForMesh, resolveTargetMeshName } from '../core/meshMapping';
+import { resolveTargetMeshName } from '../core/meshMapping';
 import {
   computeAutoGlbTransform,
   createDefaultGlbTransform,
   type GlbMeshHint,
 } from '../core/glbPlacement';
 import { buildPcKeyboardMouse, buildProceduralDevice } from './deviceBuilders';
+import { buildBackgroundEnvironment } from './backgroundEnvironments';
 import { createStudioStage, type StudioStageSystem } from './stageBuilder';
 
 interface AnimatedMeshState {
@@ -76,28 +76,12 @@ interface AnchorPinVisual {
 export interface SceneControllerCallbacks {
   onTimeUpdate: (timeMs: number, activeEvents: SequenceEvent[]) => void;
   onPlayStateChange: (isPlaying: boolean) => void;
-  onMeshSelected: (info: SelectedMeshInfo | null) => void;
-  onMeshHovered: (meshName: string | null) => void;
-  onModelLoaded: (
-    device: DeviceType,
-    fileName: string,
-    meshCount: number,
-    autoTransform?: GlbTransform,
-    isRestore?: boolean,
-  ) => void;
-  onModelError: (message: string) => void;
 }
 
 // Reusable scratch math objects (zero allocations inside render loop)
-const _vec2 = new THREE.Vector2();
 const _vec3 = new THREE.Vector3();
-const _vec3B = new THREE.Vector3();
-const _normalMat = new THREE.Matrix3();
-const _quat = new THREE.Quaternion();
 const _zAxis = new THREE.Vector3(0, 0, 1);
 const _color = new THREE.Color();
-const _hoverEmissive = new THREE.Color('#60a5fa');
-const _selectedEmissive = new THREE.Color('#34d399');
 
 function detectSoftwareWebGL(): boolean {
   try {
@@ -130,32 +114,39 @@ export class StudioSceneController {
   private devicePivot: THREE.Group;
   private currentDeviceRoot: THREE.Group | null = null;
   private currentDisposables: Array<{ dispose: () => void }> = [];
-  private currentCustomModels: Partial<Record<DeviceType, { scene: THREE.Group; fileName: string }>> = {};
-  private customPcSlots: {
-    keyboard?: { scene: THREE.Group; fileName: string };
-    mouse?: { scene: THREE.Group; fileName: string };
-  } = {};
+
+  // 3D Platform Background Monument Stage (PlayStation 5, Xbox Series X, PC Rig, iOS iPhone Pro)
+  private backgroundPivot: THREE.Group;
+  private currentBgRoot: THREE.Group | null = null;
+  private currentBgAccent: THREE.Object3D | null = null;
+  private currentBgDisposables: Array<{ dispose: () => void }> = [];
+  private bgTransitionProgress = 1;
+  private bgBaseY = -1.18;
+  private bgTargetScale = 1;
+
+  // Cached drop-in GLB models (loaded cleanly from URLs configured via props or /models/manifest.json)
+  private modelUrls: Partial<Record<DeviceType, DeviceModelUrls>> = {};
+  private customDeviceCache: Partial<
+    Record<DeviceType, { scene: THREE.Group; autoTransform: GlbTransform }>
+  > = {};
+  private customPcSubCache: { keyboard?: THREE.Group; mouse?: THREE.Group } = {};
+  private customBgCache: Partial<Record<DeviceType, THREE.Group>> = {};
+  private loadedUrlSet = new Set<string>();
 
   private deviceType: DeviceType = 'ps5';
   private sequence: TrainingSequence;
   private meshMapping: DeviceMeshMapping = {};
   private surfaceAnchors: DeviceAnchorMap = {};
   private glbTransform: GlbTransform = createDefaultGlbTransform();
-  private autoGlbTransforms: Partial<Record<DeviceType, GlbTransform>> = {};
-  private isMappingMode = false;
 
   private meshMap = new Map<string, AnimatedMeshState>();
   private pickableMeshes: THREE.Mesh[] = [];
-  private hoveredMesh: THREE.Mesh | null = null;
-  private selectedMeshName: string | null = null;
 
   // Exact 3D surface anchor pin overlay attached inside currentDeviceRoot
   private anchorOverlayGroup: THREE.Group | null = null;
   private anchorVisuals = new Map<string, AnchorPinVisual>();
-  private pendingPickMarker: THREE.Group | null = null;
-  private pendingPickMats: THREE.MeshBasicMaterial[] = [];
 
-  // iPad 3D Touch Ripples
+  // iOS / iPad 3D Touch Ripples
   private ipadRippleContainer: THREE.Group | null = null;
   private ipadScreenW = 3.76;
   private ipadScreenH = 2.52;
@@ -180,12 +171,7 @@ export class StudioSceneController {
   private cameraTargetPos: THREE.Vector3 | null = null;
   private cameraTargetLook: THREE.Vector3 | null = null;
 
-  // Raycasting
-  private raycaster = new THREE.Raycaster();
-  private lastHoverCheck = 0;
-  private pointerDownPos = { x: 0, y: 0 };
-
-  // Render loop lifecycle (supports both GPU rAF & Software WebGL afterDraw pacing)
+  // Render loop lifecycle
   private rafId = 0;
   private timerId = 0;
   private destroyed = false;
@@ -206,10 +192,12 @@ export class StudioSceneController {
 
   constructor(
     container: HTMLElement,
+    initialDevice: DeviceType,
     initialSequence: TrainingSequence,
     callbacks: SceneControllerCallbacks,
   ) {
     this.container = container;
+    this.deviceType = initialDevice;
     this.sequence = initialSequence;
     this.callbacks = callbacks;
     this.isSoftwareGl = detectSoftwareWebGL();
@@ -239,15 +227,15 @@ export class StudioSceneController {
     // 2. Scene & Seamless Satin Silver Studio Background + Poly Haven studio_small_09 IBL
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color('#c8cfd9');
-    this.scene.fog = new THREE.FogExp2('#c8cfd9', 0.032);
-    this.scene.environmentIntensity = 0.82;
+    this.scene.fog = new THREE.FogExp2('#c8cfd9', 0.017);
+    this.scene.environmentIntensity = 0.84;
     this.loadStudioHdri();
 
-    // 4. Telephoto Studio Camera (FOV 34)
+    // 3. Telephoto Studio Camera (FOV 34)
     this.camera = new THREE.PerspectiveCamera(34, width / height, 0.1, 100);
     this.applyResponsiveCameraPreset(this.deviceType, true);
 
-    // 5. Smooth OrbitControls
+    // 4. Smooth OrbitControls
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
     this.controls.enableDamping = !this.isSoftwareGl;
     this.controls.dampingFactor = 0.06;
@@ -260,7 +248,6 @@ export class StudioSceneController {
     this.controls.update();
 
     this.controls.addEventListener('start', () => {
-      // Cancel scripted camera glide immediately when user drags
       this.cameraTargetPos = null;
       this.cameraTargetLook = null;
     });
@@ -268,10 +255,10 @@ export class StudioSceneController {
       this.requestRender();
     });
 
-    // 6. 3-Point Warm/Cool Studio Lighting + Softboxes
+    // 5. Studio 3-Point Lighting
     this.setupStudioLighting();
 
-    // 7. Post-processing UnrealBloomPass (GPU only; Software WebGL renders direct to stay crisp & fast)
+    // 6. Subtle Post-Processing Bloom (GPU only)
     if (!this.isSoftwareGl) {
       try {
         this.composer = new EffectComposer(this.renderer);
@@ -292,9 +279,15 @@ export class StudioSceneController {
       }
     }
 
-    // 8. Studio Stage Pedestal & Shockwave Ring System
+    // 7. Studio Stage Pedestal & Shockwave Ring System
     this.stage = createStudioStage(this.renderer.capabilities.getMaxAnisotropy());
     this.scene.add(this.stage.group);
+
+    // 8. Mid-Background 3D Platform Monument Stage (PlayStation 5 / Xbox Series X / PC / iOS)
+    this.backgroundPivot = new THREE.Group();
+    this.backgroundPivot.name = 'PlatformBackgroundMonumentPivot';
+    this.backgroundPivot.position.set(0, this.bgBaseY, -5.8);
+    this.scene.add(this.backgroundPivot);
 
     // 9. Device Spring-Tilt & Showcase Gimbal Pivot centered above pedestal
     this.devicePivot = new THREE.Group();
@@ -303,8 +296,9 @@ export class StudioSceneController {
     this.devicePivot.position.set(0, 0.24, 0);
     this.scene.add(this.devicePivot);
 
-    // Mount initial PS5 DualSense studio model
-    this.mountDeviceModel('ps5');
+    // Mount initial platform device + matching 3D background monument
+    this.mountDeviceModel(this.deviceType);
+    this.mountBackgroundMonument(this.deviceType, true);
 
     if (!this.isSoftwareGl) {
       try {
@@ -314,7 +308,6 @@ export class StudioSceneController {
       }
     }
 
-    // Event Listeners (including ResizeObserver for iframe/flex layout changes)
     window.addEventListener('resize', this.handleResize);
     if (typeof ResizeObserver !== 'undefined') {
       this.resizeObserver = new ResizeObserver(() => {
@@ -322,12 +315,8 @@ export class StudioSceneController {
       });
       this.resizeObserver.observe(this.container);
     }
-    this.renderer.domElement.addEventListener('pointerdown', this.handlePointerDown);
-    this.renderer.domElement.addEventListener('pointerup', this.handlePointerUp);
-    this.renderer.domElement.addEventListener('pointermove', this.handlePointerMove);
     this.renderer.domElement.addEventListener('webglcontextlost', this.handleContextLost);
 
-    // Initial render
     this.requestRender();
   }
 
@@ -369,35 +358,31 @@ export class StudioSceneController {
   }
 
   private setupStudioLighting() {
-    // Subtle directional accents balanced for Poly Haven studio_small_09 HDRI IBL
-    const hemi = new THREE.HemisphereLight(0xcbdcff, 0x161b29, 0.22);
+    const hemi = new THREE.HemisphereLight(0xcbdcff, 0x161b29, 0.24);
     this.scene.add(hemi);
 
-    // Warm key light for crisp contact shadows and subtle 3D form modeling
-    const keyLight = new THREE.DirectionalLight(0xfff5e8, 0.88);
+    const keyLight = new THREE.DirectionalLight(0xfff5e8, 0.9);
     keyLight.position.set(4.5, 7.2, 5.4);
     if (!this.isSoftwareGl) {
       keyLight.castShadow = true;
       keyLight.shadow.mapSize.set(1024, 1024);
-      keyLight.shadow.camera.left = -3.8;
-      keyLight.shadow.camera.right = 3.8;
-      keyLight.shadow.camera.top = 3.8;
-      keyLight.shadow.camera.bottom = -3.8;
+      keyLight.shadow.camera.left = -4.2;
+      keyLight.shadow.camera.right = 4.2;
+      keyLight.shadow.camera.top = 4.2;
+      keyLight.shadow.camera.bottom = -4.2;
       keyLight.shadow.camera.near = 1;
-      keyLight.shadow.camera.far = 20;
+      keyLight.shadow.camera.far = 22;
       keyLight.shadow.bias = -0.0005;
       keyLight.shadow.normalBias = 0.02;
     }
     this.scene.add(keyLight);
 
-    // Cool rim backlight for dramatic hardware silhouette separation
-    const rimLight = new THREE.DirectionalLight(0x93c5fd, 0.65);
-    rimLight.position.set(-5.2, 4.4, -5.8);
+    const rimLight = new THREE.DirectionalLight(0x93c5fd, 0.68);
+    rimLight.position.set(-5.2, 4.6, -6.2);
     this.scene.add(rimLight);
 
-    // Gentle side fill
-    const fillLight = new THREE.DirectionalLight(0xe2e8f0, 0.18);
-    fillLight.position.set(-4, 2.2, 4.5);
+    const fillLight = new THREE.DirectionalLight(0xe2e8f0, 0.2);
+    fillLight.position.set(-4, 2.4, 4.8);
     this.scene.add(fillLight);
   }
 
@@ -411,19 +396,19 @@ export class StudioSceneController {
       case 'pc':
         return {
           pos: new THREE.Vector3(0, 4.95 * scaleBoost, 9.2 * scaleBoost),
-          look: new THREE.Vector3(0, -0.04, 0),
+          look: new THREE.Vector3(0, 0.08, 0),
         };
       case 'ipad':
         return {
           pos: new THREE.Vector3(0, 3.95 * scaleBoost, 8.15 * scaleBoost),
-          look: new THREE.Vector3(0, 0.25, 0),
+          look: new THREE.Vector3(0, 0.3, 0),
         };
       case 'xbox':
       case 'ps5':
       default:
         return {
-          pos: new THREE.Vector3(0, 3.85 * scaleBoost, 7.1 * scaleBoost),
-          look: new THREE.Vector3(0, -0.02, 0),
+          pos: new THREE.Vector3(0, 3.85 * scaleBoost, 7.25 * scaleBoost),
+          look: new THREE.Vector3(0, 0.12, 0),
         };
     }
   }
@@ -452,6 +437,255 @@ export class StudioSceneController {
     this.requestRender();
   }
 
+  /**
+   * Configures drop-in GLB URLs for foreground devices and 3D background monuments.
+   * Immediately loads assets for the active platform if configured.
+   */
+  public setModelUrls(models: Partial<Record<DeviceType, DeviceModelUrls>>) {
+    this.modelUrls = { ...models };
+    void this.loadConfiguredAssetsForDevice(this.deviceType);
+  }
+
+  private async fetchBinaryGlb(url: string): Promise<ArrayBuffer | null> {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) return null;
+      const contentType = res.headers.get('content-type') || '';
+      if (contentType.includes('text/html')) return null;
+      return await res.arrayBuffer();
+    } catch {
+      return null;
+    }
+  }
+
+  private async loadConfiguredAssetsForDevice(device: DeviceType): Promise<void> {
+    const cfg = this.modelUrls[device];
+    if (!cfg) return;
+
+    // 1. Optional custom foreground device GLB
+    if (cfg.deviceGlbUrl && !this.loadedUrlSet.has(`dev:${device}:${cfg.deviceGlbUrl}`)) {
+      this.loadedUrlSet.add(`dev:${device}:${cfg.deviceGlbUrl}`);
+      const buf = await this.fetchBinaryGlb(cfg.deviceGlbUrl);
+      if (buf && !this.destroyed) {
+        await this.parseForegroundGlb(device, buf, 'combined', cfg.transform);
+      }
+    }
+
+    // 2. Optional PC separate keyboard / mouse GLBs
+    if (device === 'pc') {
+      if (cfg.keyboardGlbUrl && !this.loadedUrlSet.has(`pc-kb:${cfg.keyboardGlbUrl}`)) {
+        this.loadedUrlSet.add(`pc-kb:${cfg.keyboardGlbUrl}`);
+        const buf = await this.fetchBinaryGlb(cfg.keyboardGlbUrl);
+        if (buf && !this.destroyed) {
+          await this.parseForegroundGlb('pc', buf, 'keyboard');
+        }
+      }
+      if (cfg.mouseGlbUrl && !this.loadedUrlSet.has(`pc-ms:${cfg.mouseGlbUrl}`)) {
+        this.loadedUrlSet.add(`pc-ms:${cfg.mouseGlbUrl}`);
+        const buf = await this.fetchBinaryGlb(cfg.mouseGlbUrl);
+        if (buf && !this.destroyed) {
+          await this.parseForegroundGlb('pc', buf, 'mouse');
+        }
+      }
+    }
+
+    // 3. Optional custom 3D background monument GLB
+    if (cfg.backgroundGlbUrl && !this.loadedUrlSet.has(`bg:${device}:${cfg.backgroundGlbUrl}`)) {
+      this.loadedUrlSet.add(`bg:${device}:${cfg.backgroundGlbUrl}`);
+      const buf = await this.fetchBinaryGlb(cfg.backgroundGlbUrl);
+      if (buf && !this.destroyed) {
+        await this.parseBackgroundGlb(device, buf);
+      }
+    }
+  }
+
+  private parseForegroundGlb(
+    targetDevice: DeviceType,
+    arrayBuffer: ArrayBuffer,
+    slot: 'combined' | 'keyboard' | 'mouse',
+    transformOverride?: Partial<GlbTransform>,
+  ): Promise<void> {
+    const loader = new GLTFLoader();
+    return new Promise((resolve) => {
+      loader.parse(
+        arrayBuffer,
+        '',
+        (gltf) => {
+          if (this.destroyed) {
+            resolve();
+            return;
+          }
+          const model = gltf.scene;
+          const wrapper = new THREE.Group();
+          const box = new THREE.Box3().setFromObject(model);
+          const size = box.getSize(new THREE.Vector3());
+          const center = box.getCenter(new THREE.Vector3());
+          const maxDim = Math.max(size.x, size.y, size.z, 0.001);
+
+          const hints: GlbMeshHint[] = [];
+          model.traverse((child) => {
+            if (child instanceof THREE.Mesh) {
+              child.castShadow = true;
+              child.receiveShadow = true;
+              const childBox = new THREE.Box3().setFromObject(child);
+              const childCenter = childBox.getCenter(new THREE.Vector3()).sub(center);
+              const mat = Array.isArray(child.material) ? child.material[0] : child.material;
+              hints.push({
+                name: child.name || '',
+                materialName: mat && 'name' in mat ? String(mat.name || '') : '',
+                center: [childCenter.x, childCenter.y, childCenter.z],
+              });
+            }
+          });
+
+          const isPcSub = targetDevice === 'pc' && (slot === 'keyboard' || slot === 'mouse');
+          const targetSize = isPcSub
+            ? slot === 'mouse'
+              ? 1.55
+              : 3.55
+            : targetDevice === 'pc'
+              ? 4.55
+              : 3.45;
+          const scale = targetSize / maxDim;
+          model.scale.setScalar(scale);
+
+          if (isPcSub) {
+            model.position.set(-center.x * scale, -box.min.y * scale, -center.z * scale);
+            wrapper.add(model);
+            delete this.customDeviceCache.pc;
+            this.customPcSubCache[slot] = wrapper;
+            if (this.deviceType === 'pc') {
+              this.mountDeviceModel('pc');
+            }
+          } else {
+            model.position.set(-center.x * scale, -center.y * scale, -center.z * scale);
+            wrapper.add(model);
+            const autoTransform = computeAutoGlbTransform(
+              targetDevice,
+              { x: size.x, y: size.y, z: size.z },
+              hints,
+            );
+            const finalTransform: GlbTransform = {
+              ...autoTransform,
+              ...(transformOverride ?? {}),
+            };
+            this.customDeviceCache[targetDevice] = {
+              scene: wrapper,
+              autoTransform: finalTransform,
+            };
+            if (this.deviceType === targetDevice) {
+              this.glbTransform = { ...finalTransform };
+              this.mountDeviceModel(targetDevice);
+            }
+          }
+          resolve();
+        },
+        () => resolve(),
+      );
+    });
+  }
+
+  private parseBackgroundGlb(targetDevice: DeviceType, arrayBuffer: ArrayBuffer): Promise<void> {
+    const loader = new GLTFLoader();
+    return new Promise((resolve) => {
+      loader.parse(
+        arrayBuffer,
+        '',
+        (gltf) => {
+          if (this.destroyed) {
+            resolve();
+            return;
+          }
+          const model = gltf.scene;
+          const wrapper = new THREE.Group();
+          const box = new THREE.Box3().setFromObject(model);
+          const size = box.getSize(new THREE.Vector3());
+          const center = box.getCenter(new THREE.Vector3());
+          const maxDim = Math.max(size.x, size.y, size.z, 0.001);
+          const targetHeight = 4.5;
+          const scale = targetHeight / maxDim;
+
+          model.scale.setScalar(scale);
+          // Ground cleanly on the studio floor plane at y = 0 inside backgroundPivot
+          model.position.set(-center.x * scale, -box.min.y * scale, -center.z * scale);
+          wrapper.add(model);
+          this.customBgCache[targetDevice] = wrapper;
+
+          if (this.deviceType === targetDevice) {
+            this.mountBackgroundMonument(targetDevice, false);
+          }
+          resolve();
+        },
+        () => resolve(),
+      );
+    });
+  }
+
+  private clearBackgroundMonument() {
+    if (this.currentBgRoot) {
+      this.backgroundPivot.remove(this.currentBgRoot);
+      this.currentBgRoot = null;
+    }
+    this.currentBgAccent = null;
+    for (const d of this.currentBgDisposables) {
+      d.dispose();
+    }
+    this.currentBgDisposables = [];
+  }
+
+  private getBackgroundFraming(device: DeviceType): { y: number; z: number; scale: number } {
+    const aspect = this.camera.aspect || 16 / 9;
+    const isPortrait = aspect < 1.05;
+    if (isPortrait) {
+      return {
+        y: -1.18,
+        z: device === 'pc' ? -5.6 : -4.4,
+        scale: 0.62,
+      };
+    }
+    return {
+      y: -1.18,
+      z: device === 'pc' ? -4.8 : -3.85,
+      scale: 1.0,
+    };
+  }
+
+  private mountBackgroundMonument(device: DeviceType, instant: boolean) {
+    this.clearBackgroundMonument();
+
+    const cachedBg = this.customBgCache[device];
+    if (cachedBg) {
+      const cloned = cachedBg.clone(true);
+      this.currentBgRoot = cloned;
+      this.backgroundPivot.add(cloned);
+    } else {
+      const built = buildBackgroundEnvironment(device);
+      this.currentBgRoot = built.root;
+      this.currentBgAccent = built.accentGroup ?? null;
+      this.currentBgDisposables = built.disposables;
+      this.backgroundPivot.add(built.root);
+    }
+
+    const framing = this.getBackgroundFraming(device);
+    this.bgBaseY = framing.y;
+    this.bgTargetScale = framing.scale;
+    this.backgroundPivot.position.z = framing.z;
+
+    if (instant || this.isSoftwareGl) {
+      this.bgTransitionProgress = 1;
+      this.backgroundPivot.position.y = this.bgBaseY;
+      this.backgroundPivot.scale.setScalar(this.bgTargetScale);
+    } else {
+      this.bgTransitionProgress = 0;
+      this.backgroundPivot.position.y = this.bgBaseY - 0.55;
+      this.backgroundPivot.scale.setScalar(this.bgTargetScale * 0.92);
+      this.ensureLoopRunning();
+    }
+
+    this.scene.updateMatrixWorld(true);
+    this.requestRender();
+  }
+
   private clearAnchorVisuals() {
     for (const v of this.anchorVisuals.values()) {
       v.backingMat.dispose();
@@ -460,11 +694,6 @@ export class StudioSceneController {
       v.pulseMat.dispose();
     }
     this.anchorVisuals.clear();
-    for (const m of this.pendingPickMats) {
-      m.dispose();
-    }
-    this.pendingPickMats = [];
-    this.pendingPickMarker = null;
     if (this.anchorOverlayGroup && this.anchorOverlayGroup.parent) {
       this.anchorOverlayGroup.parent.remove(this.anchorOverlayGroup);
     }
@@ -479,8 +708,6 @@ export class StudioSceneController {
     }
     this.meshMap.clear();
     this.pickableMeshes = [];
-    this.hoveredMesh = null;
-    this.selectedMeshName = null;
     if (this.ipadRippleContainer && this.ipadRippleContainer.parent) {
       this.ipadRippleContainer.parent.remove(this.ipadRippleContainer);
     }
@@ -511,7 +738,7 @@ export class StudioSceneController {
       anchor.point[2] + normal.z * 0.026,
     );
     group.quaternion.setFromUnitVectors(_zAxis, normal);
-    if (this.currentCustomModels[this.deviceType]) {
+    if (this.customDeviceCache[this.deviceType]) {
       const invScale = 1 / Math.max(0.35, this.glbTransform.scale);
       group.scale.setScalar(invScale);
     }
@@ -585,6 +812,7 @@ export class StudioSceneController {
   private rebuildAnchorOverlay() {
     this.clearAnchorVisuals();
     if (!this.currentDeviceRoot) return;
+    if (Object.keys(this.surfaceAnchors).length === 0) return;
 
     const overlay = new THREE.Group();
     overlay.name = 'SurfaceAnchorOverlay';
@@ -597,41 +825,6 @@ export class StudioSceneController {
       overlay.add(pin.group);
       this.anchorVisuals.set(btnId, pin);
     }
-
-    // Pending click preview marker (shown right where the user clicks in calibration mode)
-    const pendingGroup = new THREE.Group();
-    const bgMat = new THREE.MeshBasicMaterial({
-      color: 0x0f172a,
-      transparent: true,
-      opacity: 0.8,
-      side: THREE.DoubleSide,
-      depthWrite: false,
-    });
-    const ringMat = new THREE.MeshBasicMaterial({
-      color: 0x38bdf8,
-      transparent: true,
-      opacity: 0.98,
-      side: THREE.DoubleSide,
-      depthWrite: false,
-    });
-    const dotMat = new THREE.MeshBasicMaterial({
-      color: 0xffffff,
-      transparent: true,
-      opacity: 1,
-      side: THREE.DoubleSide,
-      depthWrite: false,
-    });
-    const bg = new THREE.Mesh(this.pinBackingGeo, bgMat);
-    const ring = new THREE.Mesh(this.pinOuterGeo, ringMat);
-    ring.position.z = 0.004;
-    const dot = new THREE.Mesh(this.pinCoreGeo, dotMat);
-    dot.position.z = 0.008;
-    pendingGroup.add(bg, ring, dot);
-    pendingGroup.visible = false;
-    overlay.add(pendingGroup);
-
-    this.pendingPickMarker = pendingGroup;
-    this.pendingPickMats = [bgMat, ringMat, dotMat];
   }
 
   private indexDeviceMeshes(root: THREE.Object3D) {
@@ -642,7 +835,6 @@ export class StudioSceneController {
         obj.name = `Mesh_${String(autoCounter++).padStart(3, '0')}`;
       }
 
-      // Clone materials per mesh so emissive highlight on one button never bleeds into sibling meshes
       const rawMats = Array.isArray(obj.material) ? obj.material : [obj.material];
       const clonedMats = rawMats.map((m) => (m ? m.clone() : m));
       obj.material = Array.isArray(obj.material) ? clonedMats : clonedMats[0];
@@ -676,18 +868,11 @@ export class StudioSceneController {
         baseEmissiveIntensity,
         currentPress: 0,
       });
-
       this.pickableMeshes.push(obj);
     });
   }
 
-  private setupIpadRipples(
-    container: THREE.Group,
-    width: number,
-    height: number,
-    onXYPlane = false,
-  ) {
-    // Dispose any previous touch ripple materials
+  private setupIpadRipples(container: THREE.Group, width: number, height: number, onXYPlane = false) {
     this.touchRipples.forEach((r) => {
       r.outerMat.dispose();
       r.innerMat.dispose();
@@ -773,7 +958,6 @@ export class StudioSceneController {
 
     const localX = (normX - 0.5) * this.ipadScreenW;
     if (this.ipadRipplesOnXYPlane) {
-      // +Y is up, normY=0 is top edge -> invert Y
       const localY = (0.5 - normY) * this.ipadScreenH;
       slot.group.position.set(localX, localY, 0.012 + this.nextRippleIdx * 0.001);
     } else {
@@ -793,12 +977,8 @@ export class StudioSceneController {
     slot.group.visible = true;
   }
 
-  /**
-   * Applies GlbTransform to a mounted custom GLB root, grounds it cleanly above the circular pedestal
-   * (zero clipping regardless of rotation/scale), and aligns the custom iPad front-screen ripple plane.
-   */
   private applyGlbTransformToCurrentRoot() {
-    if (!this.currentDeviceRoot || !this.currentCustomModels[this.deviceType]) return;
+    if (!this.currentDeviceRoot || !this.customDeviceCache[this.deviceType]) return;
 
     const root = this.currentDeviceRoot;
     const t = this.glbTransform;
@@ -807,12 +987,10 @@ export class StudioSceneController {
     root.rotation.set(t.rotX, t.rotY, t.rotZ);
     root.scale.setScalar(t.scale);
 
-    // Measure oriented bounding box in devicePivot space (temporarily zero spring tilt for stable grounding)
     const savedPivotRot = this.devicePivot.rotation.clone();
     this.devicePivot.rotation.set(0, 0, 0);
     this.devicePivot.updateMatrixWorld(true);
 
-    // Compute bounds excluding overlay & ripple helper groups
     const box = new THREE.Box3();
     for (const mesh of this.pickableMeshes) {
       box.expandByObject(mesh);
@@ -824,16 +1002,11 @@ export class StudioSceneController {
       root.position.y += deltaY;
       this.devicePivot.updateMatrixWorld(true);
 
-      // Keep 3D anchor pin size visually constant even if user scales GLB up or down
       const invScale = 1 / Math.max(0.35, t.scale);
       for (const pin of this.anchorVisuals.values()) {
         pin.group.scale.setScalar(invScale);
       }
-      if (this.pendingPickMarker) {
-        this.pendingPickMarker.scale.setScalar(invScale);
-      }
 
-      // Recompute front-facing screen plane for custom iPad GLBs (facing +Z toward the camera)
       if (this.deviceType === 'ipad') {
         const finalBox = new THREE.Box3();
         for (const mesh of this.pickableMeshes) {
@@ -842,7 +1015,6 @@ export class StudioSceneController {
         const fSize = finalBox.getSize(new THREE.Vector3());
         const fCenter = finalBox.getCenter(new THREE.Vector3());
 
-        // Attach a clean XY ripple host directly onto the front face facing +Z toward the camera
         const host = new THREE.Group();
         host.name = 'CustomIpadFrontScreenHost';
         const frontWorldPos = new THREE.Vector3(fCenter.x, fCenter.y, finalBox.max.z + 0.02);
@@ -863,7 +1035,6 @@ export class StudioSceneController {
     this.showcaseSpring = createSpring3DState();
     this.liftSpring = { value: 0, velocity: 0 };
     this.devicePivot.rotation.set(0, 0, 0);
-    // Elevate tilted iPad cleanly above pedestal top inlay so corners never clip even during spring recoil
     this.basePivotY = device === 'ipad' ? 0.56 : 0.24;
     this.devicePivot.position.y = this.basePivotY;
 
@@ -872,18 +1043,19 @@ export class StudioSceneController {
       this.stage.setNeonColor(platformMeta.pedestalGlowHex);
     }
 
-    const cachedCustom = this.currentCustomModels[device];
+    const cachedCustom = this.customDeviceCache[device];
     if (cachedCustom) {
       const cloned = cachedCustom.scene.clone(true);
       this.currentDeviceRoot = cloned;
+      this.glbTransform = { ...cachedCustom.autoTransform };
       this.devicePivot.add(cloned);
       this.indexDeviceMeshes(cloned);
       this.applyGlbTransformToCurrentRoot();
-    } else if (device === 'pc' && (this.customPcSlots.keyboard || this.customPcSlots.mouse)) {
+    } else if (device === 'pc' && (this.customPcSubCache.keyboard || this.customPcSubCache.mouse)) {
       const built = buildPcKeyboardMouse(
         this.renderer.capabilities.getMaxAnisotropy(),
-        this.customPcSlots.keyboard?.scene.clone(true),
-        this.customPcSlots.mouse?.scene.clone(true),
+        this.customPcSubCache.keyboard?.clone(true),
+        this.customPcSubCache.mouse?.clone(true),
       );
       this.currentDeviceRoot = built.root;
       this.currentDisposables = built.disposables;
@@ -917,17 +1089,17 @@ export class StudioSceneController {
   public setDevice(
     device: DeviceType,
     sequence: TrainingSequence,
-    mapping: DeviceMeshMapping,
-    anchors?: DeviceAnchorMap,
-    glbTransform?: GlbTransform,
+    mapping: DeviceMeshMapping = {},
+    anchors: DeviceAnchorMap = {},
   ) {
     this.sequence = sequence;
     this.meshMapping = mapping;
-    if (anchors) this.surfaceAnchors = anchors;
-    if (glbTransform) this.glbTransform = glbTransform;
+    this.surfaceAnchors = anchors;
     this.currentTimeMs = 0;
     this.prevEvaluatedMs = null;
     this.mountDeviceModel(device);
+    this.mountBackgroundMonument(device, false);
+    void this.loadConfiguredAssetsForDevice(device);
     this.pushHudState(true);
   }
 
@@ -952,44 +1124,6 @@ export class StudioSceneController {
   public setSurfaceAnchors(anchors: DeviceAnchorMap) {
     this.surfaceAnchors = anchors;
     this.rebuildAnchorOverlay();
-    this.evaluateAndApplyFrame(0.016, false);
-    this.requestRender();
-  }
-
-  public setGlbTransform(transform: GlbTransform) {
-    this.glbTransform = { ...transform };
-    this.applyGlbTransformToCurrentRoot();
-    this.evaluateAndApplyFrame(0.016, false);
-    this.requestRender();
-  }
-
-  public getAutoGlbTransform(device: DeviceType): GlbTransform {
-    return this.autoGlbTransforms[device]
-      ? { ...this.autoGlbTransforms[device]! }
-      : createDefaultGlbTransform();
-  }
-
-  public setMappingMode(enabled: boolean) {
-    this.isMappingMode = enabled;
-    if (!enabled) {
-      this.hoveredMesh = null;
-      this.selectedMeshName = null;
-      if (this.pendingPickMarker) this.pendingPickMarker.visible = false;
-      this.renderer.domElement.style.cursor = 'grab';
-      this.callbacks.onMeshSelected(null);
-      this.callbacks.onMeshHovered(null);
-    } else {
-      this.renderer.domElement.style.cursor = 'crosshair';
-    }
-    this.evaluateAndApplyFrame(0.016, false);
-    this.requestRender();
-  }
-
-  public setSelectedMeshName(name: string | null) {
-    this.selectedMeshName = name;
-    if (!name && this.pendingPickMarker) {
-      this.pendingPickMarker.visible = false;
-    }
     this.evaluateAndApplyFrame(0.016, false);
     this.requestRender();
   }
@@ -1021,165 +1155,6 @@ export class StudioSceneController {
     this.ensureLoopRunning();
   }
 
-  public getAvailableMeshNames(): string[] {
-    return Array.from(this.meshMap.keys());
-  }
-
-  public async loadGlbFile(
-    file: File,
-    slot: PcGlbSlot = 'combined',
-    savedTransform?: GlbTransform,
-  ): Promise<ArrayBuffer> {
-    const arrayBuffer = await file.arrayBuffer();
-    await this.loadGlbBuffer(this.deviceType, arrayBuffer, file.name, slot, {
-      silentRestore: false,
-      savedTransform,
-    });
-    return arrayBuffer;
-  }
-
-  public async loadGlbBuffer(
-    targetDevice: DeviceType,
-    arrayBuffer: ArrayBuffer,
-    fileName: string,
-    slot: PcGlbSlot = 'combined',
-    options?: {
-      silentRestore?: boolean;
-      savedTransform?: GlbTransform;
-    },
-  ): Promise<void> {
-    const loader = new GLTFLoader();
-    const isRestore = Boolean(options?.silentRestore);
-
-    return new Promise((resolve, reject) => {
-      loader.parse(
-        arrayBuffer.slice(0),
-        '',
-        (gltf) => {
-          const model = gltf.scene;
-          const wrapper = new THREE.Group();
-          wrapper.name = `CustomGLB_${slot}_${fileName}`;
-
-          // Collect mesh name & spatial hints BEFORE normalization so auto-orientation detects front/back & portrait/landscape
-          const box = new THREE.Box3().setFromObject(model);
-          const size = box.getSize(new THREE.Vector3());
-          const center = box.getCenter(new THREE.Vector3());
-          const maxDim = Math.max(size.x, size.y, size.z, 0.001);
-
-          const hints: GlbMeshHint[] = [];
-          let meshCount = 0;
-          model.traverse((child) => {
-            if (child instanceof THREE.Mesh) {
-              meshCount++;
-              child.castShadow = true;
-              child.receiveShadow = true;
-              const childBox = new THREE.Box3().setFromObject(child);
-              const childCenter = childBox.getCenter(new THREE.Vector3()).sub(center);
-              const mat = Array.isArray(child.material) ? child.material[0] : child.material;
-              hints.push({
-                name: child.name || '',
-                materialName: mat && 'name' in mat ? String(mat.name || '') : '',
-                center: [childCenter.x, childCenter.y, childCenter.z],
-              });
-            }
-          });
-
-          const isPcSubSlot = targetDevice === 'pc' && (slot === 'keyboard' || slot === 'mouse');
-          const targetSize = isPcSubSlot
-            ? slot === 'mouse'
-              ? 1.55
-              : 3.55
-            : targetDevice === 'pc'
-              ? 4.55
-              : 3.45;
-          const scale = targetSize / maxDim;
-
-          model.scale.setScalar(scale);
-          if (isPcSubSlot) {
-            // Sit flush on top of the studio desk-mat surface (y = 0)
-            model.position.set(-center.x * scale, -box.min.y * scale, -center.z * scale);
-          } else {
-            model.position.set(-center.x * scale, -center.y * scale, -center.z * scale);
-          }
-
-          wrapper.add(model);
-
-          if (isPcSubSlot) {
-            delete this.currentCustomModels.pc;
-            this.customPcSlots[slot] = { scene: wrapper, fileName };
-            const loadedParts = [
-              this.customPcSlots.keyboard?.fileName,
-              this.customPcSlots.mouse?.fileName,
-            ].filter(Boolean);
-            const displayName = loadedParts.join(' + ');
-            if (this.deviceType === 'pc') {
-              this.mountDeviceModel('pc');
-            }
-            this.callbacks.onModelLoaded('pc', displayName, meshCount, undefined, isRestore);
-          } else {
-            if (targetDevice === 'pc') {
-              this.customPcSlots = {};
-            }
-            const autoTransform = computeAutoGlbTransform(
-              targetDevice,
-              { x: size.x, y: size.y, z: size.z },
-              hints,
-            );
-            this.autoGlbTransforms[targetDevice] = autoTransform;
-
-            const chosenTransform = options?.savedTransform
-              ? { ...options.savedTransform }
-              : { ...autoTransform };
-
-            this.currentCustomModels[targetDevice] = {
-              scene: wrapper,
-              fileName,
-            };
-
-            if (this.deviceType === targetDevice) {
-              this.glbTransform = chosenTransform;
-              this.mountDeviceModel(targetDevice);
-            }
-            this.callbacks.onModelLoaded(
-              targetDevice,
-              fileName,
-              meshCount,
-              options?.savedTransform ? undefined : autoTransform,
-              isRestore,
-            );
-          }
-          resolve();
-        },
-        (err) => {
-          if (!isRestore) {
-            const msg = 'خطا در خواندن فایل سه‌بعدی. لطفاً یک فایل معتبر .glb یا .gltf انتخاب کنید.';
-            this.callbacks.onModelError(msg);
-          }
-          reject(err);
-        },
-      );
-    });
-  }
-
-  public restoreDefaultModel() {
-    delete this.currentCustomModels[this.deviceType];
-    if (this.deviceType === 'pc') {
-      this.customPcSlots = {};
-    }
-    this.mountDeviceModel(this.deviceType);
-  }
-
-  public hasCustomModel(device: DeviceType): boolean {
-    if (device === 'pc') {
-      return Boolean(
-        this.currentCustomModels.pc ||
-          this.customPcSlots.keyboard ||
-          this.customPcSlots.mouse,
-      );
-    }
-    return Boolean(this.currentCustomModels[device]);
-  }
-
   private resolveTouchCoordinate(event: SequenceEvent): { x: number; y: number } {
     if (event.touch) return event.touch;
     const spec = DEVICE_BUTTONS.ipad.find((b) => b.id === event.target_mesh);
@@ -1197,11 +1172,10 @@ export class StudioSceneController {
     );
     this.prevEvaluatedMs = this.currentTimeMs;
 
-    // Trigger shockwaves & iPad touch ripples on newly entered button presses
+    // Trigger shockwaves & iOS touch ripples on newly entered button presses
     if (triggerEffects && frame.newlyTriggered.length > 0) {
       for (const evt of frame.newlyTriggered) {
         this.stage.spawnShockwave(evt.color);
-        // If iPad has no exact manual surface anchor for this touch target, spawn ripple on detected front screen plane
         if (this.deviceType === 'ipad' && !this.surfaceAnchors[evt.target_mesh]) {
           const coord = this.resolveTouchCoordinate(evt);
           this.spawnIpadTouchRipple(coord.x, coord.y, evt.color);
@@ -1223,7 +1197,6 @@ export class StudioSceneController {
       }
 
       const concreteMesh = resolveTargetMeshName(this.meshMapping, btnId);
-      // On single-mesh or iPad models where an exact surface anchor is pinned, avoid depressing/glowing the whole chassis
       const skipWholeMeshGlow =
         this.deviceType === 'ipad' ||
         (Boolean(this.surfaceAnchors[btnId]) && this.pickableMeshes.length <= 2);
@@ -1239,10 +1212,10 @@ export class StudioSceneController {
       }
     }
 
-    // Animate exact 3D Surface Anchor Pins (flush on exact clicked spots of any GLB or procedural model)
+    // Animate exact 3D Surface Anchor Pins (when provided via props/backend API)
     for (const [btnId, pin] of this.anchorVisuals.entries()) {
       const active = activeButtonLookup.get(btnId);
-      if (active && active.intensity > 0.01 && !this.isMappingMode) {
+      if (active && active.intensity > 0.01) {
         pin.group.visible = true;
         pin.outerMat.color.set(active.color);
         pin.pulseMat.color.set(active.color);
@@ -1259,17 +1232,6 @@ export class StudioSceneController {
         pin.pulseRing.scale.setScalar(0.9 + easeOut * 1.9);
         pin.pulseMat.opacity = Math.pow(1 - pin.pulsePhase, 1.5) * 0.85 * active.intensity;
         needsMoreFrames = true;
-      } else if (this.isMappingMode) {
-        // Show all pinned spots cleanly during calibration mode so user can verify every coordinate
-        pin.group.visible = true;
-        pin.backingMat.opacity = 0.68;
-        pin.outerMat.opacity = 0.9;
-        pin.coreMat.opacity = 0.92;
-        pin.outerRing.scale.setScalar(0.85);
-        pin.backingDisc.scale.setScalar(0.85);
-        pin.coreDot.scale.setScalar(0.8);
-        pin.pulseMat.opacity = 0;
-        pin.pulsePhase = 0;
       } else {
         pin.group.visible = false;
         pin.pulseMat.opacity = 0;
@@ -1277,7 +1239,7 @@ export class StudioSceneController {
       }
     }
 
-    // Apply physical depression & emissive glow to each mesh
+    // Physical depression & emissive glow on mapped hardware meshes
     const pressLerp = 1 - Math.exp(-26 * dt);
     for (const [meshName, state] of this.meshMap.entries()) {
       const active = activeMeshLookup.get(meshName);
@@ -1290,15 +1252,10 @@ export class StudioSceneController {
         state.currentPress = targetPress;
       }
 
-      // Physical press translation
       _vec3
         .copy(state.pressAxis)
         .multiplyScalar(state.pressDistance * state.currentPress);
       state.mesh.position.copy(state.basePosition).add(_vec3);
-
-      // Material emissive highlight (active event > selected in mapper > hovered in mapper)
-      const isSelected = this.isMappingMode && this.selectedMeshName === meshName;
-      const isHovered = this.isMappingMode && this.hoveredMesh === state.mesh;
 
       for (let i = 0; i < state.materials.length; i++) {
         const mat = state.materials[i];
@@ -1306,12 +1263,6 @@ export class StudioSceneController {
           _color.set(active.color);
           mat.emissive.copy(_color);
           mat.emissiveIntensity = 0.25 + active.intensity * 1.25;
-        } else if (isSelected) {
-          mat.emissive.copy(_selectedEmissive);
-          mat.emissiveIntensity = 1.45;
-        } else if (isHovered) {
-          mat.emissive.copy(_hoverEmissive);
-          mat.emissiveIntensity = 0.95;
         } else {
           mat.emissive.copy(state.baseEmissive[i]);
           mat.emissiveIntensity = state.baseEmissiveIntensity[i];
@@ -1319,12 +1270,10 @@ export class StudioSceneController {
       }
     }
 
-    // Step second-order spring physics for tactile button recoil tilt + cinematic best-angle showcase rotation
-    const tiltTarget = this.isMappingMode ? { x: 0, y: 0, z: 0 } : frame.targetTilt;
-    const showcaseTarget = this.isMappingMode
-      ? { x: 0, y: 0, z: 0 }
-      : frame.targetShowcasePose;
-    const liftTarget = this.isMappingMode ? 0 : frame.targetLiftY;
+    // Step second-order spring physics for button recoil tilt + cinematic best-angle showcase rotation
+    const tiltTarget = frame.targetTilt;
+    const showcaseTarget = frame.targetShowcasePose;
+    const liftTarget = frame.targetLiftY;
 
     if (snapShowcase) {
       this.showcaseSpring = {
@@ -1340,11 +1289,10 @@ export class StudioSceneController {
 
     this.springTilt = stepSpring3D(this.springTilt, tiltTarget, dt, 185, 16);
 
-    if (this.isPlaying && !this.isMappingMode) {
+    if (this.isPlaying) {
       this.floatClock += dt;
     }
-    const floatOffsetY =
-      this.isPlaying && !this.isMappingMode ? Math.sin(this.floatClock * 2.2) * 0.032 : 0;
+    const floatOffsetY = this.isPlaying ? Math.sin(this.floatClock * 2.2) * 0.032 : 0;
 
     this.devicePivot.rotation.set(
       this.showcaseSpring.x.value + this.springTilt.x.value,
@@ -1352,6 +1300,21 @@ export class StudioSceneController {
       this.showcaseSpring.z.value + this.springTilt.z.value,
     );
     this.devicePivot.position.y = this.basePivotY + this.liftSpring.value + floatOffsetY;
+
+    // Smooth background 3D monument rise transition & subtle ambient studio sway
+    if (this.bgTransitionProgress < 1) {
+      this.bgTransitionProgress = Math.min(1, this.bgTransitionProgress + dt * 2.8);
+      const easeOut = 1 - Math.pow(1 - this.bgTransitionProgress, 3);
+      this.backgroundPivot.position.y = this.bgBaseY - 0.55 * (1 - easeOut);
+      this.backgroundPivot.scale.setScalar(this.bgTargetScale * (0.92 + 0.08 * easeOut));
+      needsMoreFrames = true;
+    }
+    if (this.isPlaying && this.currentBgRoot) {
+      this.backgroundPivot.rotation.y = Math.sin(this.floatClock * 0.55) * 0.055;
+      if (this.currentBgAccent) {
+        this.currentBgAccent.rotation.z = Math.sin(this.floatClock * 0.8) * 0.04;
+      }
+    }
 
     const springMoving =
       Math.abs(this.springTilt.x.velocity) > 0.001 ||
@@ -1371,7 +1334,7 @@ export class StudioSceneController {
 
     if (springMoving) needsMoreFrames = true;
 
-    // Update iPad 3D Touch Ripples
+    // Update iOS 3D Touch Ripples
     for (const slot of this.touchRipples) {
       if (!slot.active) continue;
       slot.age += dt;
@@ -1423,7 +1386,6 @@ export class StudioSceneController {
     const activeEvts = frame.activeEvents.map((a) => a.event);
     const activeKey = activeEvts.map((e) => e.id).join(',');
 
-    // Throttle HUD state updates to ~15Hz unless active events changed or forced
     if (force || activeKey !== this.lastActiveKey || now - this.lastHudPushMs >= 64) {
       this.lastHudPushMs = now;
       this.lastActiveKey = activeKey;
@@ -1445,9 +1407,6 @@ export class StudioSceneController {
     }
   }
 
-  /**
-   * Software-WebGL fence pacing from the threejs skill so SwiftShader never starves the main thread.
-   */
   private afterDraw(cb: () => void) {
     const gl = this.renderer.getContext() as WebGL2RenderingContext;
     const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
@@ -1551,99 +1510,12 @@ export class StudioSceneController {
       this.bloomPass.resolution.set(width, height);
     }
     this.applyResponsiveCameraPreset(this.deviceType, true);
+    const framing = this.getBackgroundFraming(this.deviceType);
+    this.bgBaseY = framing.y;
+    this.bgTargetScale = framing.scale;
+    this.backgroundPivot.position.set(0, framing.y, framing.z);
+    this.backgroundPivot.scale.setScalar(framing.scale);
     this.requestRender();
-  };
-
-  private raycastPointerHit(clientX: number, clientY: number): THREE.Intersection<THREE.Mesh> | null {
-    const rect = this.renderer.domElement.getBoundingClientRect();
-    _vec2.x = ((clientX - rect.left) / rect.width) * 2 - 1;
-    _vec2.y = -((clientY - rect.top) / rect.height) * 2 + 1;
-    this.raycaster.setFromCamera(_vec2, this.camera);
-    const hits = this.raycaster.intersectObjects(this.pickableMeshes, false);
-    if (hits.length > 0 && hits[0].object instanceof THREE.Mesh) {
-      return hits[0] as THREE.Intersection<THREE.Mesh>;
-    }
-    return null;
-  }
-
-  private handlePointerDown = (e: PointerEvent) => {
-    this.pointerDownPos = { x: e.clientX, y: e.clientY };
-  };
-
-  private handlePointerUp = (e: PointerEvent) => {
-    const dx = e.clientX - this.pointerDownPos.x;
-    const dy = e.clientY - this.pointerDownPos.y;
-    if (Math.hypot(dx, dy) > 6) return; // Ignore orbit drags
-
-    if (!this.isMappingMode || !this.currentDeviceRoot) return;
-
-    const hit = this.raycastPointerHit(e.clientX, e.clientY);
-    if (hit) {
-      const hitMesh = hit.object;
-      this.selectedMeshName = hitMesh.name;
-      const currentButtonId = findButtonForMesh(this.meshMapping, hitMesh.name);
-
-      // Compute exact 3D hit point & outward surface normal in currentDeviceRoot local space
-      this.currentDeviceRoot.updateMatrixWorld(true);
-      const localPt = this.currentDeviceRoot.worldToLocal(hit.point.clone());
-
-      const worldNormal = new THREE.Vector3(0, 0, 1);
-      if (hit.face) {
-        _normalMat.getNormalMatrix(hitMesh.matrixWorld);
-        worldNormal.copy(hit.face.normal).applyMatrix3(_normalMat).normalize();
-      }
-      // Ensure normal always faces outward toward the camera (handles inverted/double-sided GLB normals)
-      _vec3B.copy(this.camera.position).sub(hit.point);
-      if (worldNormal.dot(_vec3B) < 0) {
-        worldNormal.negate();
-      }
-
-      this.currentDeviceRoot.getWorldQuaternion(_quat);
-      const localNorm = worldNormal.clone().applyQuaternion(_quat.invert()).normalize();
-
-      // Show immediate live crosshair marker on the exact clicked millimeter
-      if (this.pendingPickMarker) {
-        this.pendingPickMarker.position.set(
-          localPt.x + localNorm.x * 0.022,
-          localPt.y + localNorm.y * 0.022,
-          localPt.z + localNorm.z * 0.022,
-        );
-        this.pendingPickMarker.quaternion.setFromUnitVectors(_zAxis, localNorm);
-        this.pendingPickMarker.visible = true;
-      }
-
-      this.callbacks.onMeshSelected({
-        meshName: hitMesh.name,
-        screenX: e.clientX,
-        screenY: e.clientY,
-        currentButtonId,
-        localPoint: [localPt.x, localPt.y, localPt.z],
-        localNormal: [localNorm.x, localNorm.y, localNorm.z],
-      });
-    } else {
-      this.selectedMeshName = null;
-      if (this.pendingPickMarker) this.pendingPickMarker.visible = false;
-      this.callbacks.onMeshSelected(null);
-    }
-    this.evaluateAndApplyFrame(0.016, false);
-    this.requestRender();
-  };
-
-  private handlePointerMove = (e: PointerEvent) => {
-    if (!this.isMappingMode) return;
-    const now = performance.now();
-    if (now - this.lastHoverCheck < 45) return;
-    this.lastHoverCheck = now;
-
-    const hit = this.raycastPointerHit(e.clientX, e.clientY);
-    const mesh = hit ? hit.object : null;
-    if (mesh !== this.hoveredMesh) {
-      this.hoveredMesh = mesh;
-      this.renderer.domElement.style.cursor = mesh ? 'pointer' : 'crosshair';
-      this.callbacks.onMeshHovered(mesh ? mesh.name : null);
-      this.evaluateAndApplyFrame(0.016, false);
-      this.requestRender();
-    }
   };
 
   private handleContextLost = (e: Event) => {
@@ -1658,12 +1530,10 @@ export class StudioSceneController {
     window.removeEventListener('resize', this.handleResize);
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
-    this.renderer.domElement.removeEventListener('pointerdown', this.handlePointerDown);
-    this.renderer.domElement.removeEventListener('pointerup', this.handlePointerUp);
-    this.renderer.domElement.removeEventListener('pointermove', this.handlePointerMove);
     this.renderer.domElement.removeEventListener('webglcontextlost', this.handleContextLost);
 
     this.clearCurrentDevice();
+    this.clearBackgroundMonument();
     this.stage.dispose();
     this.controls.dispose();
     this.rippleOuterGeo.dispose();

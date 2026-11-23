@@ -15,7 +15,7 @@ export function CalloutBadge({ activeEvents, hidden = false }: CalloutBadgeProps
       aria-live="polite"
       data-testid="callout-badge"
       data-active={isVisible ? 'true' : 'false'}
-      className={`fixed top-[74px] sm:top-[82px] inset-x-0 z-20 flex justify-center px-4 pointer-events-none transition-all duration-200 ease-out ${
+      className={`absolute top-[72px] sm:top-[82px] inset-x-0 z-20 flex justify-center px-4 pointer-events-none transition-all duration-200 ease-out ${
         isVisible
           ? 'opacity-100 translate-y-0 scale-100'
           : 'opacity-0 -translate-y-2 scale-95'
@@ -36,15 +36,12 @@ export function CalloutBadge({ activeEvents, hidden = false }: CalloutBadgeProps
               <span className="text-xs sm:text-sm font-semibold text-white whitespace-nowrap">
                 {primary.label}
               </span>
-              <span
-                dir="ltr"
-                className="font-mono-tabular text-[11px] text-slate-300/80 shrink-0"
-              >
+              <span className="font-mono-tabular text-[11px] text-slate-300/80 shrink-0">
                 {primary.target_mesh}
               </span>
               {secondaryCount > 0 && (
                 <span className="text-[11px] text-slate-300 shrink-0">
-                  +{secondaryCount} هم‌زمان
+                  +{secondaryCount} simultaneous
                 </span>
               )}
             </div>

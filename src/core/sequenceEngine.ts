@@ -316,14 +316,14 @@ export function validateAndNormalizeSequence(
   input: unknown,
 ): { ok: true; sequence: TrainingSequence } | { ok: false; error: string } {
   if (!input || typeof input !== 'object') {
-    return { ok: false, error: 'داده سناریو باید یک آبجکت معتبر JSON باشد.' };
+    return { ok: false, error: 'Sequence payload must be a valid JSON object.' };
   }
 
   const raw = input as Record<string, unknown>;
   const title =
     typeof raw.title === 'string' && raw.title.trim().length > 0
       ? raw.title.trim()
-      : 'سناریوی سفارشی';
+      : 'Custom Sequence';
 
   const durationMs =
     typeof raw.duration_ms === 'number' && Number.isFinite(raw.duration_ms) && raw.duration_ms > 0
@@ -331,11 +331,11 @@ export function validateAndNormalizeSequence(
       : 0;
 
   if (durationMs <= 0) {
-    return { ok: false, error: 'مقدار duration_ms باید عددی بزرگ‌تر از صفر باشد.' };
+    return { ok: false, error: 'duration_ms must be a positive number.' };
   }
 
   if (!Array.isArray(raw.events)) {
-    return { ok: false, error: 'آرایه events در ساختار JSON یافت نشد.' };
+    return { ok: false, error: 'Missing events array in sequence JSON.' };
   }
 
   const normalizedEvents: SequenceEvent[] = [];
