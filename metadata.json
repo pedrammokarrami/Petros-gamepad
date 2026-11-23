@@ -1,0 +1,6 @@
+{
+  "name": "آسترو ترینر سه‌بعدی | آموزش تعاملی کنترلرها",
+  "description": "اپلیکیشن سه‌بعدی استودیویی برای آموزش زمان‌بندی دقیق دکمه‌ها روی PS5، Xbox، کیبورد مکانیکال، ماوس گیمینگ و آیپد پرو با پشتیبانی از مدل‌های GLB.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
